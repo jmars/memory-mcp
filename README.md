@@ -14,7 +14,7 @@ This replaces it with SQLite (WAL mode) while maintaining JSONL export compatibi
 - **Fuzzy search** — trigram similarity for entity names (no more exact-case matching)
 - **Temporal queries** — `recent(hours=24)` shows everything added or modified
 - **Timestamps** — every entity, observation, and relation has `created_at`/`updated_at`
-- **Case-insensitive search** — `search_nodes("giovanni")` matches `Giovanni`
+- **Case-insensitive search** — `search_nodes("project")` matches `ProjectX`
 
 ## Tools
 
