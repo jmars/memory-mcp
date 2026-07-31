@@ -16,7 +16,7 @@ import os
 import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -694,9 +694,7 @@ def recent(hours: int = 24) -> str:
     """
     hours = max(1, min(hours, 720))
     conn = _get_conn()
-    cutoff_iso = datetime.now(timezone.utc).replace(
-        hour=datetime.now(timezone.utc).hour - hours
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Use SQLite datetime() for format-agnostic comparison
     entities = []
