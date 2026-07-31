@@ -5,15 +5,17 @@ that adds timestamps, graph traversal, fuzzy search, and temporal queries while
 maintaining backward compatibility with the JSONL file format.
 
 Storage:
-  SQLite  at MEMORY_DB_PATH   (default: ~/.vibe/memory.db)
-  JSONL   at MEMORY_FILE_PATH (default: ~/.vibe/memory.jsonl)
+  SQLite  at MEMORY_DB_PATH   (default: ~/.vibe/memory.db)  — primary store
+  JSONL   at MEMORY_FILE_PATH (default: ~/.vibe/memory.jsonl) — derived export
 
-On first startup, imports existing JSONL into SQLite. All writes go to both.
+On first startup, imports existing JSONL into SQLite. JSONL is atomically
+rebuilt from SQLite on every mutation — no incremental appends, no divergence.
 """
 import json
 import os
+import re
 import sqlite3
-import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,19 +38,29 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 _conn: sqlite3.Connection | None = None
+_conn_lock = threading.Lock()
+
+# SQL LIKE wildcards that must be escaped in user-supplied tokens
+_LIKE_ESCAPE = re.compile(r'([%_\\])')
+
+
+def _escape_like(token: str) -> str:
+    return _LIKE_ESCAPE.sub(r'\\\1', token)
 
 
 def _get_conn() -> sqlite3.Connection:
     """Get or create the SQLite connection with WAL mode."""
     global _conn
     if _conn is None:
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA foreign_keys=ON")
-        _conn.row_factory = sqlite3.Row
-        _init_schema()
-        _maybe_migrate_from_jsonl()
+        with _conn_lock:
+            if _conn is None:
+                DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _conn = sqlite3.connect(str(DB_PATH))
+                _conn.execute("PRAGMA journal_mode=WAL")
+                _conn.execute("PRAGMA foreign_keys=ON")
+                _conn.row_factory = sqlite3.Row
+                _init_schema()
+                _maybe_migrate_from_jsonl()
     return _conn
 
 
@@ -60,21 +72,21 @@ def _init_schema() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             entity_type TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
             content TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS relations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             from_entity TEXT NOT NULL,
             to_entity TEXT NOT NULL,
             relation_type TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL,
             UNIQUE(from_entity, to_entity, relation_type)
         );
         CREATE INDEX IF NOT EXISTS idx_obs_entity ON observations(entity_id);
@@ -89,7 +101,7 @@ def _now() -> str:
 
 
 # ---------------------------------------------------------------------------
-# JSONL migration & sync
+# JSONL — derived export only, atomically rebuilt on every mutation
 # ---------------------------------------------------------------------------
 
 def _maybe_migrate_from_jsonl() -> None:
@@ -100,18 +112,31 @@ def _maybe_migrate_from_jsonl() -> None:
         return
 
     entities_seen: set[str] = set()
-    for line in _read_jsonl():
-        item = json.loads(line)
+    skipped = 0
+    for line in _read_jsonl_raw():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+
         if item.get("type") == "entity":
-            name = item["name"]
+            try:
+                name = item["name"]
+            except KeyError:
+                skipped += 1
+                continue
             if name in entities_seen:
-                # Duplicate entity — append observations to existing
                 for obs in item.get("observations", []):
-                    conn.execute(
-                        "INSERT INTO observations (entity_id, content, created_at) "
-                        "SELECT id, ?, ? FROM entities WHERE name = ?",
-                        (obs, _now(), name),
-                    )
+                    if isinstance(obs, str):
+                        conn.execute(
+                            "INSERT INTO observations (entity_id, content, created_at) "
+                            "SELECT id, ?, ? FROM entities WHERE name = ?",
+                            (obs, _now(), name),
+                        )
                 continue
             entities_seen.add(name)
             conn.execute(
@@ -119,11 +144,12 @@ def _maybe_migrate_from_jsonl() -> None:
                 (name, item.get("entityType", "unknown"), _now(), _now()),
             )
             for obs in item.get("observations", []):
-                conn.execute(
-                    "INSERT INTO observations (entity_id, content, created_at) "
-                    "SELECT id, ?, ? FROM entities WHERE name = ?",
-                    (obs, _now(), name),
-                )
+                if isinstance(obs, str):
+                    conn.execute(
+                        "INSERT INTO observations (entity_id, content, created_at) "
+                        "SELECT id, ?, ? FROM entities WHERE name = ?",
+                        (obs, _now(), name),
+                    )
         elif item.get("type") == "relation":
             try:
                 conn.execute(
@@ -132,40 +158,31 @@ def _maybe_migrate_from_jsonl() -> None:
                     (item["from"], item["to"], item.get("relationType", "related_to"), _now()),
                 )
             except (KeyError, sqlite3.IntegrityError):
-                continue
+                skipped += 1
     conn.commit()
 
 
-def _read_jsonl() -> list[str]:
-    """Read non-empty lines from the JSONL file."""
+def _read_jsonl_raw() -> list[str]:
+    """Read non-empty lines from the JSONL file. Uses strict encoding."""
     if not JSONL_PATH.exists():
         return []
     try:
-        text = JSONL_PATH.read_text(encoding="utf-8", errors="replace")
+        text = JSONL_PATH.read_text(encoding="utf-8", errors="strict")
         return [ln.strip() for ln in text.splitlines() if ln.strip()]
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
 
 
-def _append_jsonl(entry: dict) -> None:
-    """Append a single entry to the JSONL file."""
-    try:
-        JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(JSONL_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
-
-
 def _rebuild_jsonl() -> None:
-    """Rebuild the entire JSONL file from SQLite."""
+    """Atomically rebuild the JSONL file from SQLite (temp file + rename)."""
     conn = _get_conn()
     entries: list[dict] = []
 
-    for row in conn.execute("SELECT name, entity_type FROM entities ORDER BY id"):
+    # Select entity id so we can join directly, avoiding duplicate-name ambiguity
+    for row in conn.execute("SELECT id, name, entity_type FROM entities ORDER BY id"):
         obs_rows = conn.execute(
-            "SELECT content FROM observations WHERE entity_id = (SELECT id FROM entities WHERE name = ?) ORDER BY id",
-            (row["name"],),
+            "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
+            (row["id"],),
         ).fetchall()
         entries.append({
             "type": "entity",
@@ -182,11 +199,11 @@ def _rebuild_jsonl() -> None:
             "relationType": row["relation_type"],
         })
 
+    content = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n"
+    tmp_path = JSONL_PATH.with_suffix(".jsonl.tmp")
     JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    JSONL_PATH.write_text(
-        "\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n",
-        encoding="utf-8",
-    )
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, JSONL_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +216,9 @@ def _trigram_similarity(a: str, b: str) -> float:
     b = b.lower()
     if a == b:
         return 1.0
+    if not a or not b:
+        return 0.0
     if len(a) < 3 or len(b) < 3:
-        # Short strings: direct substring match
         return 0.8 if (a in b or b in a) else 0.0
 
     def trigrams(s: str) -> set[str]:
@@ -210,9 +228,24 @@ def _trigram_similarity(a: str, b: str) -> float:
     tb = trigrams(b)
     if not ta or not tb:
         return 0.0
-    intersection = ta & tb
-    union = ta | tb
-    return len(intersection) / len(union)
+    return len(ta & tb) / len(ta | tb)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_entity_id(conn: sqlite3.Connection, name: str) -> int | None:
+    row = conn.execute("SELECT id FROM entities WHERE name = ?", (name,)).fetchone()
+    return row["id"] if row else None
+
+
+def _get_obs_by_entity_id(conn: sqlite3.Connection, entity_id: int) -> list[str]:
+    rows = conn.execute(
+        "SELECT content FROM observations WHERE entity_id = ? ORDER BY id",
+        (entity_id,),
+    ).fetchall()
+    return [r["content"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -228,40 +261,36 @@ def create_entities(entities: list[dict]) -> str:
     conn = _get_conn()
     created = 0
     errors: list[str] = []
+    now = _now()
 
     for e in entities:
         name = e.get("name")
         etype = e.get("entityType", "unknown")
         observations = e.get("observations", [])
 
-        if not name:
-            errors.append("Missing 'name' in entity")
+        if not name or not isinstance(name, str):
+            errors.append("Missing or invalid 'name' in entity")
             continue
 
         try:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO entities (name, entity_type, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (name, etype, _now(), _now()),
+                (name, etype, now, now),
             )
+            entity_id = cur.lastrowid
             for obs in observations:
-                conn.execute(
-                    "INSERT INTO observations (entity_id, content, created_at) "
-                    "SELECT id, ?, ? FROM entities WHERE name = ?",
-                    (obs, _now(), name),
-                )
+                if isinstance(obs, str):
+                    conn.execute(
+                        "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
+                        (entity_id, obs, now),
+                    )
             created += 1
-            _append_jsonl({
-                "type": "entity",
-                "name": name,
-                "entityType": etype,
-                "observations": observations,
-            })
         except sqlite3.IntegrityError:
             errors.append(f"Entity already exists: {name}")
-        except Exception as ex:
-            errors.append(f"Error creating '{name}': {ex}")
 
     conn.commit()
+    if created > 0:
+        _rebuild_jsonl()
     msg = f"Created {created} entities."
     if errors:
         msg += f" Errors: {'; '.join(errors)}"
@@ -277,34 +306,32 @@ def create_relations(relations: list[dict]) -> str:
     conn = _get_conn()
     created = 0
     errors: list[str] = []
+    now = _now()
 
     for r in relations:
         from_e = r.get("from")
         to_e = r.get("to")
-        rtype = r.get("relationType", "related_to")
+        rtype = r.get("relationType")
 
         if not from_e or not to_e:
             errors.append("Missing 'from' or 'to' in relation")
+            continue
+        if not rtype:
+            errors.append(f"Missing 'relationType' for {from_e} -> {to_e}")
             continue
 
         try:
             conn.execute(
                 "INSERT INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)",
-                (from_e, to_e, rtype, _now()),
+                (from_e, to_e, rtype, now),
             )
             created += 1
-            _append_jsonl({
-                "type": "relation",
-                "from": from_e,
-                "to": to_e,
-                "relationType": rtype,
-            })
         except sqlite3.IntegrityError:
             errors.append(f"Relation already exists: {from_e} -> {to_e} ({rtype})")
-        except Exception as ex:
-            errors.append(f"Error creating relation: {ex}")
 
     conn.commit()
+    if created > 0:
+        _rebuild_jsonl()
     msg = f"Created {created} relations."
     if errors:
         msg += f" Errors: {'; '.join(errors)}"
@@ -320,6 +347,7 @@ def add_observations(observations: list[dict]) -> str:
     conn = _get_conn()
     added = 0
     errors: list[str] = []
+    now = _now()
 
     for item in observations:
         entity_name = item.get("entityName")
@@ -329,24 +357,22 @@ def add_observations(observations: list[dict]) -> str:
             errors.append("Missing 'entityName'")
             continue
 
-        row = conn.execute("SELECT id FROM entities WHERE name = ?", (entity_name,)).fetchone()
-        if not row:
+        entity_id = _get_entity_id(conn, entity_name)
+        if entity_id is None:
             errors.append(f"Entity not found: {entity_name}")
             continue
 
-        entity_id = row["id"]
-        now = _now()
         for content in contents:
-            conn.execute(
-                "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
-                (entity_id, content, now),
-            )
-            added += 1
+            if isinstance(content, str):
+                conn.execute(
+                    "INSERT INTO observations (entity_id, content, created_at) VALUES (?, ?, ?)",
+                    (entity_id, content, now),
+                )
+                added += 1
 
         conn.execute("UPDATE entities SET updated_at = ? WHERE id = ?", (now, entity_id))
 
     conn.commit()
-    # Rebuild JSONL to reflect added observations
     if added > 0:
         _rebuild_jsonl()
 
@@ -363,6 +389,8 @@ def delete_entities(entityNames: list[str]) -> str:
     deleted = 0
 
     for name in entityNames:
+        # Clean up dangling relations first (relations use soft FKs by name)
+        conn.execute("DELETE FROM relations WHERE from_entity = ? OR to_entity = ?", (name, name))
         cursor = conn.execute("DELETE FROM entities WHERE name = ?", (name,))
         deleted += cursor.rowcount
 
@@ -390,12 +418,11 @@ def delete_observations(deletions: list[dict]) -> str:
             errors.append("Missing 'entityName'")
             continue
 
-        row = conn.execute("SELECT id FROM entities WHERE name = ?", (entity_name,)).fetchone()
-        if not row:
+        entity_id = _get_entity_id(conn, entity_name)
+        if entity_id is None:
             errors.append(f"Entity not found: {entity_name}")
             continue
 
-        entity_id = row["id"]
         for obs_content in obs_to_delete:
             cursor = conn.execute(
                 "DELETE FROM observations WHERE entity_id = ? AND content = ?",
@@ -416,16 +443,27 @@ def delete_observations(deletions: list[dict]) -> str:
 def delete_relations(relations: list[dict]) -> str:
     """Delete multiple relations from the knowledge graph.
 
-    Each relation must have: from (str), to (str), relationType (str).
+    Each relation must have: from (str), to (str), relationType (str). If relationType
+    is omitted, all relations between from and to are deleted.
     """
     conn = _get_conn()
     deleted = 0
 
     for r in relations:
-        cursor = conn.execute(
-            "DELETE FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?",
-            (r.get("from"), r.get("to"), r.get("relationType", "related_to")),
-        )
+        from_e = r.get("from")
+        to_e = r.get("to")
+        rtype = r.get("relationType")
+
+        if rtype:
+            cursor = conn.execute(
+                "DELETE FROM relations WHERE from_entity = ? AND to_entity = ? AND relation_type = ?",
+                (from_e, to_e, rtype),
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM relations WHERE from_entity = ? AND to_entity = ?",
+                (from_e, to_e),
+            )
         deleted += cursor.rowcount
 
     conn.commit()
@@ -448,20 +486,23 @@ def search_nodes(query: str) -> str:
     conn = _get_conn()
     tokens = query.lower().split()
 
-    # Build a query that matches any token against name, type, or observations
+    if not tokens:
+        return json.dumps({"entities": [], "relations": []})
+
     conditions = []
     params: list[str] = []
     for token in tokens:
-        like = f"%{token}%"
+        escaped = _escape_like(token)
+        like = f"%{escaped}%"
         conditions.append(
-            "(LOWER(e.name) LIKE ? OR LOWER(e.entity_type) LIKE ? "
-            "OR e.id IN (SELECT entity_id FROM observations WHERE LOWER(content) LIKE ?))"
+            "(LOWER(e.name) LIKE ? ESCAPE '\\' OR LOWER(e.entity_type) LIKE ? ESCAPE '\\' "
+            "OR e.id IN (SELECT entity_id FROM observations WHERE LOWER(content) LIKE ? ESCAPE '\\'))"
         )
         params.extend([like, like, like])
 
     where = " OR ".join(conditions)
     rows = conn.execute(
-        f"SELECT DISTINCT e.name, e.entity_type FROM entities e WHERE {where} ORDER BY e.name",
+        f"SELECT DISTINCT e.id, e.name, e.entity_type FROM entities e WHERE {where} ORDER BY e.name",
         params,
     ).fetchall()
 
@@ -470,33 +511,30 @@ def search_nodes(query: str) -> str:
 
     result_entities = []
     result_relations = []
-    names = {r["name"] for r in rows}
+    names_list = [r["name"] for r in rows]
 
     for row in rows:
-        obs_rows = conn.execute(
-            "SELECT content FROM observations WHERE entity_id = (SELECT id FROM entities WHERE name = ?) ORDER BY id",
-            (row["name"],),
-        ).fetchall()
         result_entities.append({
             "name": row["name"],
             "entityType": row["entity_type"],
-            "observations": [o["content"] for o in obs_rows],
+            "observations": _get_obs_by_entity_id(conn, row["id"]),
         })
 
     # Include relations between matched entities
-    rel_rows = conn.execute(
-        "SELECT from_entity, to_entity, relation_type FROM relations WHERE from_entity IN ({}) OR to_entity IN ({})".format(
-            ",".join("?" * len(names)), ",".join("?" * len(names))
-        ),
-        list(names) + list(names),
-    ).fetchall()
+    if names_list:
+        placeholders = ",".join("?" * len(names_list))
+        rel_rows = conn.execute(
+            f"SELECT from_entity, to_entity, relation_type FROM relations "
+            f"WHERE from_entity IN ({placeholders}) OR to_entity IN ({placeholders})",
+            names_list + names_list,
+        ).fetchall()
 
-    for rel in rel_rows:
-        result_relations.append({
-            "from": rel["from_entity"],
-            "to": rel["to_entity"],
-            "relationType": rel["relation_type"],
-        })
+        for rel in rel_rows:
+            result_relations.append({
+                "from": rel["from_entity"],
+                "to": rel["to_entity"],
+                "relationType": rel["relation_type"],
+            })
 
     return json.dumps({"entities": result_entities, "relations": result_relations})
 
@@ -505,28 +543,23 @@ def search_nodes(query: str) -> str:
 def open_nodes(names: list[str]) -> str:
     """Open specific nodes in the knowledge graph by their names.
 
-    Returns full entity details including all observations.
+    Returns full entity details including all observations and timestamps.
     """
     conn = _get_conn()
     entities = []
 
     for name in names:
         row = conn.execute(
-            "SELECT name, entity_type, created_at, updated_at FROM entities WHERE name = ?",
+            "SELECT id, name, entity_type, created_at, updated_at FROM entities WHERE name = ?",
             (name,),
         ).fetchone()
         if not row:
             continue
 
-        obs_rows = conn.execute(
-            "SELECT content, created_at FROM observations WHERE entity_id = (SELECT id FROM entities WHERE name = ?) ORDER BY id",
-            (name,),
-        ).fetchall()
-
         entities.append({
             "name": row["name"],
             "entityType": row["entity_type"],
-            "observations": [o["content"] for o in obs_rows],
+            "observations": _get_obs_by_entity_id(conn, row["id"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         })
@@ -539,20 +572,17 @@ def read_graph() -> str:
     """Read the entire knowledge graph.
 
     Returns all entities with observations and all relations.
+    Note: loads the full graph into memory — may be large.
     """
     conn = _get_conn()
     entities = []
     relations = []
 
-    for row in conn.execute("SELECT name, entity_type FROM entities ORDER BY name"):
-        obs_rows = conn.execute(
-            "SELECT content FROM observations WHERE entity_id = (SELECT id FROM entities WHERE name = ?) ORDER BY id",
-            (row["name"],),
-        ).fetchall()
+    for row in conn.execute("SELECT id, name, entity_type FROM entities ORDER BY name"):
         entities.append({
             "name": row["name"],
             "entityType": row["entity_type"],
-            "observations": [o["content"] for o in obs_rows],
+            "observations": _get_obs_by_entity_id(conn, row["id"]),
         })
 
     for row in conn.execute("SELECT from_entity, to_entity, relation_type FROM relations ORDER BY id"):
@@ -579,7 +609,6 @@ def traverse(start_node: str, depth: int = 1) -> str:
     """
     conn = _get_conn()
 
-    # Verify start node exists
     row = conn.execute("SELECT name FROM entities WHERE name = ?", (start_node,)).fetchone()
     if not row:
         return json.dumps({"error": f"Entity not found: {start_node}", "entities": [], "relations": []})
@@ -587,6 +616,7 @@ def traverse(start_node: str, depth: int = 1) -> str:
     depth = max(1, min(depth, 3))
     visited: set[str] = {start_node}
     frontier = {start_node}
+    seen_relations: set[tuple[str, str, str]] = set()
     all_relations: list[dict] = []
 
     for _ in range(depth):
@@ -602,11 +632,14 @@ def traverse(start_node: str, depth: int = 1) -> str:
             frontier_list,
         ).fetchall()
         for r in rels:
-            all_relations.append({
-                "from": r["from_entity"],
-                "to": r["to_entity"],
-                "relationType": r["relation_type"],
-            })
+            key = (r["from_entity"], r["to_entity"], r["relation_type"])
+            if key not in seen_relations:
+                seen_relations.add(key)
+                all_relations.append({
+                    "from": r["from_entity"],
+                    "to": r["to_entity"],
+                    "relationType": r["relation_type"],
+                })
             if r["to_entity"] not in visited:
                 visited.add(r["to_entity"])
                 next_frontier.add(r["to_entity"])
@@ -617,33 +650,31 @@ def traverse(start_node: str, depth: int = 1) -> str:
             frontier_list,
         ).fetchall()
         for r in rels:
-            all_relations.append({
-                "from": r["from_entity"],
-                "to": r["to_entity"],
-                "relationType": r["relation_type"],
-            })
+            key = (r["from_entity"], r["to_entity"], r["relation_type"])
+            if key not in seen_relations:
+                seen_relations.add(key)
+                all_relations.append({
+                    "from": r["from_entity"],
+                    "to": r["to_entity"],
+                    "relationType": r["relation_type"],
+                })
             if r["from_entity"] not in visited:
                 visited.add(r["from_entity"])
                 next_frontier.add(r["from_entity"])
 
         frontier = next_frontier
 
-    # Fetch entity details for all visited nodes
     entities = []
     for name in sorted(visited):
         erow = conn.execute(
-            "SELECT name, entity_type FROM entities WHERE name = ?", (name,),
+            "SELECT id, name, entity_type FROM entities WHERE name = ?", (name,),
         ).fetchone()
         if not erow:
             continue
-        obs_rows = conn.execute(
-            "SELECT content FROM observations WHERE entity_id = (SELECT id FROM entities WHERE name = ?) ORDER BY id",
-            (name,),
-        ).fetchall()
         entities.append({
             "name": erow["name"],
             "entityType": erow["entity_type"],
-            "observations": [o["content"] for o in obs_rows],
+            "observations": _get_obs_by_entity_id(conn, erow["id"]),
         })
 
     return json.dumps({
@@ -659,35 +690,33 @@ def recent(hours: int = 24) -> str:
     """Return entities, relations, and observations created or updated in the last N hours.
 
     Args:
-        hours: Look-back window in hours (default 24)
+        hours: Look-back window in hours (default 24, max 720)
     """
+    hours = max(1, min(hours, 720))
     conn = _get_conn()
-    cutoff = datetime.now(timezone.utc).timestamp() - (hours * 3600)
-    # SQLite datetime comparison: convert cutoff to ISO format
-    cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cutoff_iso = datetime.now(timezone.utc).replace(
+        hour=datetime.now(timezone.utc).hour - hours
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Entities created or updated recently
+    # Use SQLite datetime() for format-agnostic comparison
     entities = []
     for row in conn.execute(
-        "SELECT name, entity_type, created_at, updated_at FROM entities WHERE updated_at >= ? ORDER BY updated_at DESC",
+        "SELECT id, name, entity_type, created_at, updated_at FROM entities "
+        "WHERE datetime(updated_at) >= datetime(?) ORDER BY updated_at DESC",
         (cutoff_iso,),
     ):
-        obs_rows = conn.execute(
-            "SELECT content FROM observations WHERE entity_id = (SELECT id FROM entities WHERE name = ?) ORDER BY id",
-            (row["name"],),
-        ).fetchall()
         entities.append({
             "name": row["name"],
             "entityType": row["entity_type"],
-            "observations": [o["content"] for o in obs_rows],
+            "observations": _get_obs_by_entity_id(conn, row["id"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         })
 
-    # Relations created recently
     relations = []
     for row in conn.execute(
-        "SELECT from_entity, to_entity, relation_type, created_at FROM relations WHERE created_at >= ? ORDER BY created_at DESC",
+        "SELECT from_entity, to_entity, relation_type, created_at FROM relations "
+        "WHERE datetime(created_at) >= datetime(?) ORDER BY created_at DESC",
         (cutoff_iso,),
     ):
         relations.append({
@@ -713,6 +742,7 @@ def search_similar(name: str, threshold: float = 0.3) -> str:
         name:      Name to search for (fuzzy matched)
         threshold: Minimum similarity score 0.0–1.0 (default 0.3)
     """
+    threshold = max(0.0, min(threshold, 1.0))
     conn = _get_conn()
     rows = conn.execute("SELECT name, entity_type FROM entities").fetchall()
 
@@ -740,6 +770,5 @@ def search_similar(name: str, threshold: float = 0.3) -> str:
 
 def main() -> None:
     """Run the MCP server."""
-    # Ensure DB is initialized on startup
     _get_conn()
     mcp.run(transport="stdio")
